@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { Writable } from "node:stream";
 import { promisify } from "node:util";
 import { createServer, type ServerResponse, type IncomingMessage } from "node:http";
 import { readFile, writeFile } from "node:fs/promises";
@@ -99,6 +100,43 @@ it("cancels an open SSE response when its output stream fails", async () => {
   });
   await expect(runRequest(["--sse-json", "-o", outputPath, url])).rejects.toThrow();
   await expect.poll(() => upstreamClosed).toBe(true);
+});
+
+it("cancels an open SSE response when an injected Writable fails asynchronously", async () => {
+  let upstreamClosed = false;
+  let finish: (() => void) | undefined;
+  const url = await server((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: 1\n\n");
+    res.on("close", () => {
+      upstreamClosed = true;
+    });
+    finish = () => res.end();
+  });
+  const failure = new Error("output failed");
+  const stdout = new Writable({
+    write(_chunk, _encoding, callback) {
+      setImmediate(() => callback(failure));
+    },
+  });
+  // Keep the pre-fix stream error from becoming an uncaught exception.
+  stdout.on("error", () => {});
+  let outcome: unknown;
+  const request = runRequest(["--sse-json", url], { stdout }).then(
+    () => {
+      outcome = "resolved";
+    },
+    (error: unknown) => {
+      outcome = error;
+    },
+  );
+  try {
+    await expect.poll(() => outcome).toBe(failure);
+    await expect.poll(() => upstreamClosed).toBe(true);
+  } finally {
+    finish?.();
+    await request;
+  }
 });
 
 it("cancels an open SSE response when creating its output directory fails", async () => {

@@ -2,6 +2,7 @@ import { createWriteStream } from "node:fs";
 import { File } from "node:buffer";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname } from "node:path";
+import { Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -1467,14 +1468,12 @@ async function writeResponseBody(
         (options) => sseToNdjson(response, headerText, options?.signal),
         createWriteStream(outputPath),
       );
-    } else if (stdout === process.stdout) {
-      await pipeline(
-        (options) => sseToNdjson(response, headerText, options?.signal),
-        process.stdout,
-        { end: false },
-      );
+    } else if (stdout instanceof Writable) {
+      await pipeline((options) => sseToNdjson(response, headerText, options?.signal), stdout, {
+        end: false,
+      });
     } else {
-      for await (const chunk of sseToNdjson(response, headerText)) await write(stdout, chunk);
+      for await (const chunk of sseToNdjson(response, headerText)) write(stdout, chunk);
     }
     return;
   }
