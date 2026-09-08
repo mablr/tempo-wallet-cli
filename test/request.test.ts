@@ -143,6 +143,24 @@ describe("request command", () => {
         code: "E_PAYMENT_OUTCOME_UNKNOWN",
         message: expect.stringContaining("metadata-test"),
       });
+      for (const flag of ["--stream", "--sse"]) {
+        await expect(
+          runRequest(
+            [
+              "--private-key",
+              `0x${"1".repeat(64)}`,
+              flag,
+              "-o",
+              join(home, "stream.txt"),
+              server.url("/broken"),
+            ],
+            { stdout: captureStdout() },
+          ),
+        ).rejects.toMatchObject({
+          code: "E_PAYMENT_OUTCOME_UNKNOWN",
+          message: expect.stringContaining("metadata-test"),
+        });
+      }
       await expect(
         runRequest(["--private-key", `0x${"1".repeat(64)}`, server.url("/paid")], {
           stdout: new Writable({
@@ -207,9 +225,18 @@ describe("request command", () => {
     expect(JSON.parse(await readFile(meta, "utf8"))).toMatchObject({ status: 422 });
   });
 
-  it.each([{ flags: [] }, { flags: ["--sse-json"] }])(
-    "classifies interrupted unpaid error bodies as network failures through the CLI ($flags)",
-    async ({ flags }) => {
+  it.each([
+    { flags: [], file: false },
+    { flags: ["--sse-json"], file: false },
+    { flags: ["--stream"], file: false },
+    { flags: ["--sse"], file: false },
+    { flags: ["--stream"], file: true },
+    { flags: ["--sse"], file: true },
+  ])(
+    "classifies interrupted unpaid error bodies as network failures through the CLI ($flags, file=$file)",
+    async ({ flags, file }) => {
+      const home = await useTempHome();
+      const output = join(home, "partial.txt");
       const server = await testServer((_request, response) => {
         response.writeHead(500, { "content-length": "100" });
         response.write("partial error");
@@ -221,7 +248,14 @@ describe("request command", () => {
       }>((resolve) => {
         execFile(
           process.execPath,
-          ["--import", "tsx", "src/request-cli.ts", ...flags, server.url("/error")],
+          [
+            "--import",
+            "tsx",
+            "src/request-cli.ts",
+            ...flags,
+            ...(file ? ["-o", output] : []),
+            server.url("/error"),
+          ],
           { cwd: join(import.meta.dirname, ".."), timeout: 15000 },
           (error, _stdout, stderr) => resolve({ code: error?.code, stderr }),
         );
@@ -230,6 +264,28 @@ describe("request command", () => {
       expect(result.stderr).toContain("E_NETWORK");
     },
   );
+
+  it("preserves output errors and cancels an unfinished streaming body", async () => {
+    const home = await useTempHome();
+    const server = await testServer((_request, response) => {
+      response.writeHead(200);
+      response.write("still streaming");
+    });
+    const result = await new Promise<{
+      code: number | string | null | undefined;
+      stderr: string;
+    }>((resolve) => {
+      execFile(
+        process.execPath,
+        ["--import", "tsx", "src/request-cli.ts", "--stream", "-o", home, server.url("/stream")],
+        { cwd: join(import.meta.dirname, ".."), timeout: 5000 },
+        (error, _stdout, stderr) => resolve({ code: error?.code, stderr }),
+      );
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("EISDIR");
+    expect(result.stderr).not.toContain("E_NETWORK");
+  });
 
   it("keeps actual CLI SSE error output valid NDJSON", async () => {
     const server = await testServer((_request, response) => {

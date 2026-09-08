@@ -769,11 +769,7 @@ async function payAndRetryRequest(
 
     const credential = await payment.createCredential(challengeResponse);
     const paidInit = payment.transport.setCredential(cloneRequestInit(request.init), credential);
-    return await fetchPaidRequest(
-      { init: paidInit, url: request.url },
-      options,
-      credential,
-    );
+    return await fetchPaidRequest({ init: paidInit, url: request.url }, options, credential);
   } catch (error) {
     if (error && typeof error === "object" && isActionablePaymentError(error)) throw error;
     const diagnostic = spendingLimitDiagnostic(error, header, options);
@@ -1670,6 +1666,26 @@ function responseBodyNetworkError(error: unknown): never {
   throw networkError(error instanceof Error ? error.message : String(error));
 }
 
+async function* readResponseBody(body: ReadableStream<Uint8Array>, signal?: AbortSignal) {
+  const reader = body.getReader();
+  const cancel = () => {
+    void reader.cancel().catch(() => undefined);
+  };
+  signal?.addEventListener("abort", cancel, { once: true });
+  if (signal?.aborted) cancel();
+  try {
+    while (true) {
+      const { done, value } = await reader.read().catch(responseBodyNetworkError);
+      if (done) return;
+      yield value;
+    }
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+}
+
 async function writeResponseBody(
   response: Response,
   options: RequestOptions,
@@ -1713,10 +1729,13 @@ async function writeResponseBody(
     if (outputPath) {
       await mkdir(dirname(outputPath), { recursive: true });
       if (headerText) await writeFile(outputPath, headerText);
-      await pipeline(body, createWriteStream(outputPath, { flags: headerText ? "a" : "w" }));
+      await pipeline(
+        ({ signal } = {}) => readResponseBody(body, signal),
+        createWriteStream(outputPath, { flags: headerText ? "a" : "w" }),
+      );
     } else {
       await write(stdout, headerText);
-      await pipeline(body, process.stdout);
+      await pipeline(({ signal } = {}) => readResponseBody(body, signal), process.stdout);
     }
     return;
   }
