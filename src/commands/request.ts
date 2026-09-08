@@ -451,14 +451,20 @@ async function fetchWithRetries(
     try {
       const response = await fetchWithRedirects(request, options, fetchImpl);
       if (attempt + 1 < attempts && retryStatuses.has(response.status)) {
-        await waitBeforeRetry(response, options, attempt);
+        await response.body?.cancel();
+        await waitBeforeRetry(response, options, attempt, request.init.signal);
         continue;
       }
       return response;
     } catch (error) {
       lastError = error;
-      if (attempt + 1 >= attempts) break;
-      await waitBeforeRetry(undefined, options, attempt);
+      if (request.init.signal?.aborted || attempt + 1 >= attempts) break;
+      try {
+        await waitBeforeRetry(undefined, options, attempt, request.init.signal);
+      } catch (error) {
+        lastError = error;
+        break;
+      }
     }
   }
 
@@ -1445,15 +1451,31 @@ async function writeResponseBody(
   const headerText = includeHeaders ? responseHeaderText(response) : "";
 
   if (options.head) {
-    write(stdout, headerText);
-    if (outputPath) await writeFile(outputPath, headerText);
+    await writeOutput(outputPath, headerText, stdout);
     return;
   }
 
   if (options.sseJson) {
-    const text = await response.text();
-    const body = sseToNdjson(text);
-    await writeOutput(outputPath, `${headerText}${body}`, stdout);
+    if (outputPath) {
+      try {
+        await mkdir(dirname(outputPath), { recursive: true });
+      } catch (error) {
+        await response.body?.cancel().catch(() => undefined);
+        throw error;
+      }
+      await pipeline(
+        (options) => sseToNdjson(response, headerText, options?.signal),
+        createWriteStream(outputPath),
+      );
+    } else if (stdout === process.stdout) {
+      await pipeline(
+        (options) => sseToNdjson(response, headerText, options?.signal),
+        process.stdout,
+        { end: false },
+      );
+    } else {
+      for await (const chunk of sseToNdjson(response, headerText)) await write(stdout, chunk);
+    }
     return;
   }
 
@@ -1720,9 +1742,9 @@ async function appendFormField(form: UndiciFormData, field: string) {
     const file = new File([await readFile(rawPath)], basename(rawPath), {
       type: contentType ?? "application/octet-stream",
     });
-    form.set(name, file, basename(rawPath));
+    form.append(name, file, basename(rawPath));
   } else {
-    form.set(name, value);
+    form.append(name, value);
   }
 }
 
@@ -1742,6 +1764,7 @@ async function waitBeforeRetry(
   response: Response | undefined,
   options: RequestOptions,
   attempt: number,
+  signal: AbortSignal | null | undefined,
 ) {
   const retryAfter =
     response && (options.retryAfter || options.retries !== undefined)
@@ -1752,7 +1775,7 @@ async function waitBeforeRetry(
   const jitter = options.retryJitter
     ? Math.floor(exponential * ((Math.random() * options.retryJitter) / 100))
     : 0;
-  await sleep(retryAfter ?? exponential + jitter);
+  await sleep(retryAfter ?? exponential + jitter, undefined, { signal: signal ?? undefined });
 }
 
 function retryAfterMs(value: string | null) {
@@ -1764,26 +1787,61 @@ function retryAfterMs(value: string | null) {
   return undefined;
 }
 
-function sseToNdjson(text: string) {
-  const lines: string[] = [];
-  for (const event of text.split(/\n\n+/)) {
-    const eventName =
-      event
-        .split("\n")
-        .find((line) => line.startsWith("event:"))
-        ?.slice("event:".length)
-        .trim() || "data";
-    const data = event
-      .split("\n")
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.slice("data:".length).trimStart())
-      .join("\n");
-    if (data)
-      lines.push(
-        `${JSON.stringify({ event: eventName, data: parseSseData(data), ts: new Date().toISOString() })}\n`,
-      );
+async function* sseToNdjson(response: Response, headerText: string, signal?: AbortSignal) {
+  if (!response.body) {
+    if (headerText) yield headerText;
+    return;
   }
-  return lines.join("");
+  const reader = response.body.getReader();
+  const cancel = () => void reader.cancel(signal?.reason).catch(() => undefined);
+  if (signal?.aborted) cancel();
+  else signal?.addEventListener("abort", cancel, { once: true });
+  const decoder = new TextDecoder();
+  let pending = "";
+  let skipLeadingLf = false;
+  let eventName = "data";
+  let data: string[] = [];
+  try {
+    if (headerText) yield headerText;
+    while (true) {
+      const { value, done } = await reader.read();
+      pending += done ? decoder.decode() : decoder.decode(value, { stream: true });
+      while (true) {
+        if (skipLeadingLf) {
+          if (pending.length === 0) break;
+          if (pending[0] === "\n") pending = pending.slice(1);
+          skipLeadingLf = false;
+        }
+        const boundary = pending.search(/[\r\n]/);
+        if (boundary < 0) break;
+        const line = pending.slice(0, boundary);
+        skipLeadingLf = pending[boundary] === "\r";
+        pending = pending.slice(boundary + 1);
+        if (line === "") {
+          if (data.length > 0)
+            yield `${JSON.stringify({ event: eventName, data: parseSseData(data.join("\n")), ts: new Date().toISOString() })}\n`;
+          eventName = "data";
+          data = [];
+        } else {
+          const separator = line.indexOf(":");
+          const field = separator < 0 ? line : line.slice(0, separator);
+          const raw = separator < 0 ? "" : line.slice(separator + 1);
+          const value = raw.startsWith(" ") ? raw.slice(1) : raw;
+          if (field === "event") eventName = value || "data";
+          else if (field === "data") data.push(value);
+        }
+      }
+      // SSE dispatches only events terminated by a blank line.
+      if (done) break;
+    }
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    try {
+      await reader.cancel();
+    } finally {
+      reader.releaseLock();
+    }
+  }
 }
 
 function parseSseData(data: string) {
