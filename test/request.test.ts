@@ -207,6 +207,30 @@ describe("request command", () => {
     expect(JSON.parse(await readFile(meta, "utf8"))).toMatchObject({ status: 422 });
   });
 
+  it.each([{ flags: [] }, { flags: ["--sse-json"] }])(
+    "classifies interrupted unpaid error bodies as network failures through the CLI ($flags)",
+    async ({ flags }) => {
+      const server = await testServer((_request, response) => {
+        response.writeHead(500, { "content-length": "100" });
+        response.write("partial error");
+        setTimeout(() => response.destroy(), 50);
+      });
+      const result = await new Promise<{
+        code: number | string | null | undefined;
+        stderr: string;
+      }>((resolve) => {
+        execFile(
+          process.execPath,
+          ["--import", "tsx", "src/request-cli.ts", ...flags, server.url("/error")],
+          { cwd: join(import.meta.dirname, ".."), timeout: 15000 },
+          (error, _stdout, stderr) => resolve({ code: error?.code, stderr }),
+        );
+      });
+      expect(result.code).toBe(3);
+      expect(result.stderr).toContain("E_NETWORK");
+    },
+  );
+
   it("keeps actual CLI SSE error output valid NDJSON", async () => {
     const server = await testServer((_request, response) => {
       response.statusCode = 500;

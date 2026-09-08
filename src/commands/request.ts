@@ -469,7 +469,7 @@ export async function executeRequest(options: RequestOptions, io: RequestRunOpti
     if (options.dumpHeader) await writeHeadersFile(options.dumpHeader, response);
     if (options.writeMeta) await writeMetaFile(options.writeMeta, response, started);
     if (response.status >= 400 && options.sseJson) {
-      const body = await response.text();
+      const body = await response.text().catch(responseBodyNetworkError);
       await writeOutput(
         options.output ?? (options.remoteName ? remoteNamePath(options.url) : undefined),
         `${JSON.stringify({ event: "error", status: response.status, message: `HTTP ${response.status}${body ? `: ${body}` : ""}`, ts: new Date().toISOString() })}\n`,
@@ -1666,6 +1666,10 @@ function offeredTempoCurrencies(header: string | null) {
   }
 }
 
+function responseBodyNetworkError(error: unknown): never {
+  throw networkError(error instanceof Error ? error.message : String(error));
+}
+
 async function writeResponseBody(
   response: Response,
   options: RequestOptions,
@@ -1717,7 +1721,7 @@ async function writeResponseBody(
     return;
   }
 
-  const body = Buffer.from(await response.arrayBuffer());
+  const body = Buffer.from(await response.arrayBuffer().catch(responseBodyNetworkError));
   await writeOutput(
     outputPath,
     headerText ? Buffer.concat([Buffer.from(headerText), body]) : body,
