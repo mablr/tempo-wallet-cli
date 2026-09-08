@@ -424,9 +424,12 @@ export async function currentWhoamiOutput(options: {
     walletAddress: options.walletAddress,
   });
   return {
-    ready: Boolean(options.walletAddress && paymentKey),
+    ready: Boolean(options.walletAddress && paymentKey && balance),
     wallet: options.walletAddress?.toLowerCase() ?? null,
-    balance: balanceOutput(balance, sessions, tokenSymbol(token)),
+    balance: {
+      ...balanceOutput(balance, sessions, tokenSymbol(token)),
+      ...(options.walletAddress && !balance ? { error: balanceQueryError } : {}),
+    },
     balances,
     key: currentKeyOutput({
       key,
@@ -492,7 +495,8 @@ function currentKeyOutput(options: {
     balance:
       options.balance && options.balance.token.toLowerCase() === token.toLowerCase()
         ? options.balance.formatted
-        : "0.000000",
+        : null,
+    ...(options.walletAddress && !options.balance ? { balance_error: balanceQueryError } : {}),
     spending_limit: {
       unlimited: false,
       limit: limit ? formatMicroUnits(cleanStoredScalar(limit.limit)) : "0.000000",
@@ -663,6 +667,11 @@ function formatAccessKeyLimit(value: string | undefined, decimals: number) {
   }
 }
 
+const balanceQueryError = {
+  code: "E_RPC" as const,
+  message: "Unable to query token balance. Check RPC connectivity and TEMPO_RPC_URL.",
+};
+
 type SessionStats = {
   active: number;
   locked: bigint;
@@ -739,13 +748,12 @@ function balanceOutput(
   sessions: SessionStats,
   fallbackSymbol: string,
 ) {
-  const available = balance?.raw ?? 0n;
-  const total = available + sessions.locked + sessions.pendingRefund;
+  const total = balance ? balance.raw + sessions.locked + sessions.pendingRefund : null;
   return {
-    total: formatTokenUnits(total, 6),
+    total: total === null ? null : formatTokenUnits(total, 6),
     locked: formatTokenUnits(sessions.locked, 6),
     pending_refund: formatTokenUnits(sessions.pendingRefund, 6),
-    available: balance?.formatted ?? "0.000000",
+    available: balance?.formatted ?? null,
     active_sessions: sessions.active,
     symbol: balance?.symbol ?? fallbackSymbol,
   };

@@ -73,6 +73,33 @@ describe("generated CLI metadata", () => {
     expect(schema.options.properties.search.description).toContain("Search by name");
   });
 
+  it("advertises nullable wallet balances and RPC diagnostics", async () => {
+    const whoami = JSON.parse(await walletCli(["whoami", "--schema", "--format", "json"])) as {
+      output: {
+        anyOf: {
+          properties?: {
+            balance?: { properties: { available: { anyOf: { type: string }[] } } };
+            key?: { anyOf: { properties?: Record<string, unknown> }[] };
+          };
+        }[];
+      };
+    };
+    const detailedWhoami = whoami.output.anyOf.find((item) => item.properties?.balance);
+    expect(detailedWhoami?.properties?.balance?.properties.available.anyOf).toContainEqual({
+      type: "null",
+    });
+    expect(detailedWhoami?.properties?.key?.anyOf[0]?.properties).toHaveProperty("balance_error");
+
+    const keys = JSON.parse(await walletCli(["keys", "list", "--schema", "--format", "json"])) as {
+      output: {
+        properties: {
+          keys: { items: { properties: Record<string, unknown> } };
+        };
+      };
+    };
+    expect(keys.output.properties.keys.items.properties).toHaveProperty("balance_error");
+  });
+
   it.each([
     ["long json", ["services", "--json-output", "--schema"]],
     ["short json", ["services", "-j", "--schema"]],
