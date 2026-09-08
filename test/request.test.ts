@@ -52,6 +52,20 @@ afterEach(async () => {
   servers.length = 0;
 });
 
+it("pins ephemeral clients without an offered chain to the selected network", async () => {
+  const identity = await resolvePaymentIdentity(
+    parseRequestArgs([
+      "--network",
+      "testnet",
+      "--private-key",
+      `0x${"1".repeat(64)}`,
+      "https://example.com",
+    ]),
+  );
+  const client = await identity.getClient({});
+  expect(client.chain?.id).toBe(42431);
+});
+
 describe("request command", () => {
   it("performs a non-payment GET request", async () => {
     const server = await testServer((_request, response) => {
@@ -284,14 +298,21 @@ describe("request command", () => {
     expect(seen?.body).toContain("file-content");
   });
 
-  it("dry-runs a 402 by returning headers/body without payment execution", async () => {
+  it("dry-runs a 402 by returning a decoded quote without payment execution", async () => {
     const home = await useTempHome();
     const headersPath = join(home, "payment-headers.txt");
     const server = await testServer((_request, response) => {
       response.statusCode = 402;
       response.setHeader(
         "www-authenticate",
-        'Payment realm="example", method="tempo", intent="charge", request="abc"',
+        Challenge.serialize(
+          paymentChallenge({
+            amount: "6000",
+            currency: "0x20c0000000000000000000000000000000000000",
+            id: "dry-run",
+            intent: "charge",
+          }),
+        ),
       );
       response.end("Payment Required");
     });
@@ -299,7 +320,7 @@ describe("request command", () => {
 
     await runRequest(["--dry-run", "-D", headersPath, server.url("/paid")], { stdout });
 
-    expect(stdout.text()).toBe("Payment Required");
+    expect(JSON.parse(stdout.text())).toMatchObject({ amount: "0.006", within_budget: null });
     expect(await readFile(headersPath, "utf8")).toContain("www-authenticate");
   });
 

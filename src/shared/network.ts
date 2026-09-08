@@ -1,6 +1,8 @@
 import { createPublicClient, http, type Address } from "viem";
 import { Chain } from "viem/tempo";
 
+import { usageError } from "./errors.js";
+
 import { mainnetEscrow, moderatoEscrow, moderatoToken, usdcToken } from "./constants.js";
 
 export function chainId(network: string | undefined) {
@@ -8,7 +10,7 @@ export function chainId(network: string | undefined) {
 }
 
 export function isTestnet(network: string | undefined) {
-  return network === "testnet" || process.env.TEMPO_WALLET_NETWORK === "testnet";
+  return normalizeNetwork(network ?? process.env.TEMPO_WALLET_NETWORK ?? "mainnet") === "testnet";
 }
 
 export function networkName(chain: number | null) {
@@ -51,3 +53,9 @@ export function tokenSymbol(token: string) {
 }
 
 export const appUrl = process.env.TEMPO_AUTH_URL ?? "https://wallet.tempo.xyz";
+
+export function normalizeNetwork(value: string) {
+  if (value === "testnet" || value === "tempo-moderato" || value === "moderato") return "testnet";
+  if (value === "mainnet" || value === "tempo") return "mainnet";
+  throw usageError(`Unsupported network: ${value}`);
+}

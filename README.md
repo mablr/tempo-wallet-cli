@@ -70,6 +70,17 @@ tempo request --dry-run https://example.mpp.tempo.xyz/v1/resource
 tempo request https://example.mpp.tempo.xyz/v1/resource
 ```
 
+On HTTP 402, `--dry-run` prints a JSON quote with the selected amount, token, chain and
+budget assessment, without opening the wallet or paying. `--max-spend` rejects an offer
+above the cap in both preview and execution; invalid amounts fail before the HTTP request.
+For reusable sessions, execution also checks cumulative spending against the cap.
+Capped recurring subscriptions are rejected because a per-period authorization cannot enforce
+a cumulative cap.
+
+`--network` overrides `TEMPO_WALLET_NETWORK`; the default is mainnet. `tempo`/`mainnet`
+and `tempo-moderato`/`moderato`/`testnet` are aliases. Unknown networks and payment
+challenges for a different chain are rejected before payment.
+
 When a server offers both reusable sessions and one-time charges, choose an intent explicitly:
 
 ```sh
