@@ -1713,7 +1713,8 @@ function validatePaymentAddresses(challenge: Challenge.Challenge) {
   const request = challenge.request as Record<string, unknown>;
   if (!isAddress(stringValue(request.currency)))
     throw paymentError("Payment challenge is missing a valid currency address");
-  if (!isAddress(stringValue(request.recipient)))
+  const isProof = challenge.intent === "charge" && BigInt(request.amount as string) === 0n;
+  if (!isProof && !isAddress(stringValue(request.recipient)))
     throw paymentError("Payment challenge is missing a valid recipient address");
 }
 

@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
 import { promisify } from "node:util";
-import { Challenge } from "mppx";
+import { Challenge, Credential } from "mppx";
 import { afterEach, expect, it } from "vitest";
 
 const exec = promisify(execFile);
@@ -46,7 +46,12 @@ async function fixture(
       return;
     }
     requests++;
-    if (req.headers.authorization) authenticated++;
+    if (req.headers.authorization) {
+      authenticated++;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(Credential.deserialize(req.headers.authorization).payload));
+      return;
+    }
     res.writeHead(402, { "www-authenticate": Challenge.serialize(challenge) });
     res.end("Payment Required");
   });
@@ -130,7 +135,31 @@ it("rejects capped recurring subscriptions before RPC or authorization", async (
   expect(server.counts()).toEqual({ requests: 1, authenticated: 0, rpc: 0 });
 });
 
+it("authenticates a zero-amount charge without a recipient or RPC access", async () => {
+  const server = await fixture("charge", 4217, { amount: "0", recipient: undefined });
+  const quote = await server.run("--dry-run", "--max-spend", "0");
+  expect(quote.code).toBe(0);
+  expect(JSON.parse(quote.stdout)).toMatchObject({ amount: "0", within_budget: true });
+  expect(server.counts()).toEqual({ requests: 1, authenticated: 0, rpc: 0 });
+
+  const result = await server.run("--max-spend", "0");
+  expect(result.code).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({
+    type: "proof",
+    signature: expect.stringMatching(/^0x[0-9a-f]+$/i),
+  });
+  expect(server.counts()).toEqual({ requests: 3, authenticated: 1, rpc: 0 });
+});
+
 it.each([
+  ["charge", { recipient: undefined }, "valid recipient address"],
+  ["charge", { recipient: "invalid" }, "valid recipient address"],
+  ["charge", { amount: "0", currency: "invalid", recipient: undefined }, "valid currency address"],
+  [
+    "session",
+    { amount: "0", recipient: undefined, methodDetails: { chainId: 4217, sessionProtocol: "v2" } },
+    "valid recipient address",
+  ],
   ["charge", { currency: "invalid" }, "valid currency address"],
   [
     "session",
