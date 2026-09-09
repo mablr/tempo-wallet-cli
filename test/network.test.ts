@@ -24,3 +24,16 @@ describe("network selection", () => {
     expect(chainId(undefined)).toBe(42431);
   });
 });
+
+it.each(["mainnet", "tempo"])("explicit %s overrides testnet environment", (network) => {
+  process.env.TEMPO_WALLET_NETWORK = "testnet";
+  expect(chainId(network)).toBe(4217);
+});
+it.each(["testnet", "tempo-moderato", "moderato"])("resolves %s consistently", (network) => {
+  expect(chainId(network)).toBe(42431);
+  process.env.TEMPO_WALLET_NETWORK = network;
+  expect(chainId(undefined)).toBe(42431);
+});
+it("rejects unknown networks", () => {
+  expect(() => chainId("typo")).toThrow("Unsupported network");
+});

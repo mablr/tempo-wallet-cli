@@ -53,6 +53,7 @@ import {
   createTempoPublicClient,
   escrowContract,
   networkName,
+  normalizeNetwork,
   rpcUrl,
 } from "../shared/network.js";
 import { getRecord, nowSeconds, parseOnChainBigInt, stringValue } from "../shared/utils.js";
@@ -245,10 +246,10 @@ export function parseRequestArgs(argv: readonly string[]): RequestOptions {
         break;
       case "-m":
       case "--timeout":
-        options.maxTime = parsePositiveInteger(requireValue(argv, ++index, arg), arg);
+        options.maxTime = Number(requireValue(argv, ++index, arg));
         break;
       case "--connect-timeout":
-        options.connectTimeout = parsePositiveInteger(requireValue(argv, ++index, arg), arg);
+        options.connectTimeout = Number(requireValue(argv, ++index, arg));
         break;
       case "-d":
       case "--data":
@@ -317,12 +318,55 @@ export function parseRequestArgs(argv: readonly string[]): RequestOptions {
     }
   }
 
+  if (positionals.length !== 1) throw usageError("URL is required");
+  const url = positionals[0];
+  if (!url) throw usageError("URL is required");
+  const result = { ...options, url };
+  validateRequestOptions(result);
+  return result;
+}
+
+function validateRequestOptions(options: RequestOptions) {
+  validateUrl(options.url);
+  options.network = normalizeNetwork(
+    options.network ?? process.env.TEMPO_WALLET_NETWORK ?? "mainnet",
+  );
+  if (options.maxSpend !== undefined && !/^\d+(?:\.\d{1,6})?$/.test(options.maxSpend))
+    throw usageError("--max-spend must be a non-negative amount with at most 6 decimal places");
+  if (options.paymentToken !== undefined)
+    options.paymentToken = paymentTokenValue(options.paymentToken);
+  if (options.paymentIntent !== undefined) paymentIntentValue(options.paymentIntent);
+  for (const [value, flag] of [
+    [options.maxTime, "--timeout"],
+    [options.connectTimeout, "--connect-timeout"],
+  ] as const) {
+    if (
+      value !== undefined &&
+      (!Number.isFinite(value) || value <= 0 || Math.ceil(value * 1000) > 2_147_483_647)
+    )
+      throw usageError(`${flag} must be positive and at most 2147483.647 seconds`);
+  }
+  for (const [value, flag] of [
+    [options.retries, "--retries"],
+    [options.retryBackoffMs, "--retry-backoff"],
+    [options.retryJitter, "--retry-jitter"],
+    [options.maxRedirs, "--max-redirs"],
+  ] as const) {
+    if (value !== undefined) parseNonNegativeInteger(String(value), flag);
+  }
+  if (options.retryHttp !== undefined) {
+    const statuses = parseRetryStatuses(options.retryHttp, options.retries);
+    if (!options.retryHttp || [...statuses].some((status) => status < 100 || status > 599))
+      throw usageError("--retry-http must contain HTTP status codes between 100 and 599");
+  }
+  if (options.json !== undefined && options.toon !== undefined)
+    throw usageError("--json cannot be used with --toon");
   if (options.requestHttp1 && options.requestHttp2)
     throw usageError("--http2 cannot be used with --http1.1");
   if (
-    options.form.length > 0 &&
-    (options.data.length > 0 ||
-      options.dataUrlencode.length > 0 ||
+    options.form.length &&
+    (options.data.length ||
+      options.dataUrlencode.length ||
       options.json !== undefined ||
       options.toon !== undefined ||
       options.get)
@@ -330,27 +374,86 @@ export function parseRequestArgs(argv: readonly string[]): RequestOptions {
     throw usageError(
       "--form cannot be used with --data, --data-urlencode, --json, --toon, or --get",
     );
-  if (positionals.length !== 1) throw usageError("URL is required");
+}
 
-  const url = positionals[0];
-  if (!url) throw usageError("URL is required");
-  validateUrl(url);
-
-  return { ...options, url };
+// Pass exactly the validated offer to mppx. Observation hooks cannot reject payment.
+function preparePaymentChallenge(response: Response, options: RequestOptions, requestUrl: string) {
+  const selected = selectPaymentTokenResponse(response, options.paymentToken);
+  const header = selected.headers.get("www-authenticate");
+  const error = paymentChallengeError(header);
+  if (error) throw error;
+  let challenges: Challenge.Challenge[];
+  try {
+    challenges = Challenge.deserializeList(header!);
+  } catch {
+    throw paymentError("Malformed payment challenge");
+  }
+  const session =
+    options.paymentIntent !== "charge" ? sessionChallengeFromHeader(header) : undefined;
+  const challenge =
+    session ??
+    challenges.find(
+      (offer) =>
+        offer.method === "tempo" &&
+        (offer.intent === "charge" ||
+          (options.paymentIntent === "auto" && offer.intent === "subscription")),
+    );
+  if (!challenge || (options.paymentIntent === "session" && !session))
+    throw paymentError("Server did not offer a compatible payment intent");
+  const details = getRecord(challenge.request.methodDetails);
+  const offeredChain =
+    details.chainId ?? (challenge.intent === "subscription" ? 42431 : chainId(options.network));
+  if (offeredChain !== chainId(options.network))
+    throw paymentError(
+      `Payment network mismatch: expected chain ${chainId(options.network)}, received ${String(offeredChain)}`,
+    );
+  if (challenge.intent === "subscription" && options.maxSpend !== undefined)
+    throw paymentError(
+      "--max-spend cannot enforce cumulative spending for recurring subscriptions; choose a charge or session offer",
+    );
+  enforceMaxSpend(challenge, options);
+  validatePaymentAddresses(challenge);
+  if (challenge.intent === "session") sessionDetails(challenge, requestUrl, options);
+  const headers = new Headers(selected.headers);
+  headers.set("www-authenticate", Challenge.serialize(challenge));
+  return { challenge, response: new Response(null, { status: selected.status, headers }) };
 }
 
 export async function executeRequest(options: RequestOptions, io: RequestRunOptions = {}) {
+  validateRequestOptions(options);
   const stdout = io.stdout ?? process.stdout;
   const started = Date.now();
-  const request = await buildFetchRequest(options);
-  let response = await fetchWithRetries(request, options);
+  let { request, response } = await fetchWithRetries(await buildFetchRequest(options), options);
 
   if (options.dumpHeader) await writeHeadersFile(options.dumpHeader, response);
   if (options.writeMeta) await writeMetaFile(options.writeMeta, response, started);
 
   if (response.status === 402) {
     if (options.dryRun) {
-      await writeResponseBody(response, options, stdout);
+      const { challenge } = preparePaymentChallenge(response, options, request.url);
+      await writeOutput(
+        options.output,
+        `${JSON.stringify(
+          {
+            payment_required: true,
+            method: challenge.method,
+            intent: challenge.intent,
+            recurring: challenge.intent === "subscription",
+            amount: formatTokenAmount(challengeAmount(challenge)),
+            amount_raw: challenge.request.amount,
+            token: challenge.request.currency,
+            chain_id: normalizedChallengeChainId(
+              getRecord(challenge.request.methodDetails),
+              options,
+            ),
+            max_spend: options.maxSpend ?? null,
+            within_budget: options.maxSpend ? true : null,
+          },
+          null,
+          2,
+        )}\n`,
+        stdout,
+      );
       return;
     }
 
@@ -432,7 +535,7 @@ async function buildFetchRequest(options: RequestOptions) {
     redirect: "manual",
   };
   if (body !== undefined) init.body = body;
-  if (options.maxTime) init.signal = AbortSignal.timeout(options.maxTime * 1000);
+  if (options.maxTime) init.signal = AbortSignal.timeout(Math.ceil(options.maxTime * 1000));
   init.dispatcher = buildDispatcher(options);
 
   return { init, url: url.toString() };
@@ -449,12 +552,13 @@ async function fetchWithRetries(
 
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
-      const response = await fetchWithRedirects(request, options, fetchImpl);
+      const result = await fetchWithRedirects(request, options, fetchImpl);
+      const { response } = result;
       if (attempt + 1 < attempts && retryStatuses.has(response.status)) {
         await waitBeforeRetry(response, options, attempt);
         continue;
       }
-      return response;
+      return result;
     } catch (error) {
       lastError = error;
       if (attempt + 1 >= attempts) break;
@@ -475,10 +579,11 @@ async function fetchWithRedirects(
 
   for (let redirects = 0; ; redirects++) {
     const response = await fetchImpl(current.url, cloneRequestInit(current.init));
-    if (!options.followRedirects || !isRedirectStatus(response.status)) return response;
+    if (!options.followRedirects || !isRedirectStatus(response.status))
+      return { request: current, response };
 
     const location = response.headers.get("location");
-    if (!location) return response;
+    if (!location) return { request: current, response };
     if (redirects >= limit) throw networkError(`Too many redirects: exceeded ${limit}`);
 
     current = redirectRequest(current, response.status, location);
@@ -515,13 +620,15 @@ async function payAndRetryRequest(
   request: FetchPlan,
   options: RequestOptions,
 ) {
-  const selectedResponse = selectPaymentTokenResponse(
+  const { response: selectedResponse } = preparePaymentChallenge(
+    paymentRequiredResponse,
+    options,
+    request.url,
+  );
+  const header = selectPaymentTokenResponse(
     paymentRequiredResponse,
     options.paymentToken,
-  );
-  const header = selectedResponse.headers.get("www-authenticate");
-  const preflightError = paymentChallengeError(header);
-  if (preflightError) throw preflightError;
+  ).headers.get("www-authenticate");
   const challengeResponse = tempoPaymentChallengeResponse(selectedResponse);
 
   const sessionChallenge = sessionChallengeFromHeader(header);
@@ -559,6 +666,7 @@ async function payAndRetryRequest(
     const getClient = identity.getClient;
     const methodOptions = {
       ...identity.methodOptions,
+      expectedChainId: chainId(options.network),
       getClient,
       ...(options.maxSpend ? { maxDeposit: options.maxSpend } : {}),
     };
@@ -571,7 +679,6 @@ async function payAndRetryRequest(
     });
 
     payment.onChallengeReceived(async ({ challenge, createCredential }) => {
-      enforceMaxSpend(challenge, options);
       if (provider && providerState!.store.getState().accounts.length === 0)
         await ensureProviderAccounts(provider);
       return await createCredential(paymentContext(challenge, options) as never);
@@ -579,10 +686,7 @@ async function payAndRetryRequest(
 
     const credential = await payment.createCredential(challengeResponse);
     const paidInit = payment.transport.setCredential(cloneRequestInit(request.init), credential);
-    return await fetchWithRetries(
-      { init: paidInit, url: paymentRequiredResponse.url || request.url },
-      options,
-    );
+    return (await fetchWithRetries({ init: paidInit, url: request.url }, options)).response;
   } catch (error) {
     if (error && typeof error === "object" && isActionablePaymentError(error)) throw error;
     const diagnostic = spendingLimitDiagnostic(error, header, options);
@@ -607,6 +711,7 @@ async function paySessionAndRetryRequest(
       methods: [
         tempoSession({
           ...identity.methodOptions,
+          getClient: identity.getClient,
           ...(options.maxSpend ? { maxDeposit: options.maxSpend } : {}),
         }),
       ],
@@ -650,10 +755,8 @@ async function paySessionAndRetryRequest(
     }
 
     const paidInit = payment.transport.setCredential(cloneRequestInit(request.init), credential);
-    const response = await fetchWithRetries(
-      { init: paidInit, url: paymentRequiredResponse.url || request.url },
-      options,
-    );
+    const response = (await fetchWithRetries({ init: paidInit, url: request.url }, options))
+      .response;
     if (reusable && response.status === 402) {
       const recovered = await tryTopUpAndRetry({
         credential,
@@ -691,11 +794,16 @@ export async function resolvePaymentIdentity(options: RequestOptions) {
   const privateKey = options.privateKey ?? process.env.TEMPO_PRIVATE_KEY;
   if (privateKey) {
     const account = privateKeyToAccount(privateKey as `0x${string}`);
-    const getClient = ({ chainId }: { chainId?: number | undefined }) =>
+    const getClient = ({ chainId: requestedChainId }: { chainId?: number | undefined }) =>
       createWalletClient({
         account,
-        chain: chainId === 42431 ? Chain.tempoModerato : Chain.tempo,
-        transport: http(rpcUrl(chainId === 42431 ? "testnet" : "mainnet")),
+        chain:
+          (requestedChainId ?? chainId(options.network)) === 42431
+            ? Chain.tempoModerato
+            : Chain.tempo,
+        transport: http(
+          rpcUrl((requestedChainId ?? chainId(options.network)) === 42431 ? "testnet" : "mainnet"),
+        ),
       });
     return {
       address: account.address,
@@ -728,8 +836,8 @@ export async function resolvePaymentIdentity(options: RequestOptions) {
     store: { getState(): { accounts: { address: string }[]; activeAccount: number } };
   };
   await ensureProviderAccounts(provider);
-  const getClient = ({ chainId }: { chainId?: number | undefined }) => {
-    const client = provider.getClient({ chainId });
+  const getClient = ({ chainId: requestedChainId }: { chainId?: number | undefined }) => {
+    const client = provider.getClient({ chainId: requestedChainId ?? chainId(options.network) });
     const state = providerState.store.getState();
     const account = state.accounts[state.activeAccount];
     if (!account) throw new Error("No active account.");
@@ -811,11 +919,16 @@ export async function storedAccessKeyIdentity(walletState: WalletState, options:
     if (!account) continue;
     if (key.address.toLowerCase() !== account.accessKeyAddress.toLowerCase()) continue;
 
-    const getClient = ({ chainId }: { chainId?: number | undefined }) =>
+    const getClient = ({ chainId: requestedChainId }: { chainId?: number | undefined }) =>
       createWalletClient({
         account,
-        chain: chainId === 42431 ? Chain.tempoModerato : Chain.tempo,
-        transport: http(rpcUrl(chainId === 42431 ? "testnet" : "mainnet")),
+        chain:
+          (requestedChainId ?? chainId(options.network)) === 42431
+            ? Chain.tempoModerato
+            : Chain.tempo,
+        transport: http(
+          rpcUrl((requestedChainId ?? chainId(options.network)) === 42431 ? "testnet" : "mainnet"),
+        ),
       });
     return {
       account,
@@ -865,11 +978,13 @@ function sessionDetails(
 
   const expectedEscrow =
     sessionProtocol === "v2" ? TempoChannel.address : escrowContract(resolvedChainId);
-  const advertisedEscrow = stringValue(methodDetails.escrowContract);
-  if (advertisedEscrow && advertisedEscrow.toLowerCase() !== expectedEscrow.toLowerCase())
-    throw paymentError(
-      `Unsupported Tempo session escrow: expected ${expectedEscrow}, received ${advertisedEscrow}`,
-    );
+  for (const advertisedEscrow of [methodDetails.escrowContract, methodDetails.escrow]) {
+    const address = stringValue(advertisedEscrow);
+    if (address && address.toLowerCase() !== expectedEscrow.toLowerCase())
+      throw paymentError(
+        `Unsupported Tempo session escrow: expected ${expectedEscrow}, received ${address}`,
+      );
+  }
 
   return {
     amount,
@@ -996,10 +1111,9 @@ async function tryTopUpAndRetry(options: {
   );
   const topUpInit = topUpRequestInit(options.request.init);
   const authorizedTopUp = options.payment.transport.setCredential(topUpInit, topUpCredential);
-  const topUpResponse = await fetchWithRetries(
-    { init: authorizedTopUp, url: options.paymentRequiredResponse.url || options.request.url },
-    options.options,
-  );
+  const topUpResponse = (
+    await fetchWithRetries({ init: authorizedTopUp, url: options.request.url }, options.options)
+  ).response;
   if (topUpResponse.status >= 400) return topUpResponse;
 
   await upsertSessionRecord({
@@ -1013,10 +1127,9 @@ async function tryTopUpAndRetry(options: {
     cloneRequestInit(options.request.init),
     options.credential,
   );
-  const retried = await fetchWithRetries(
-    { init: paidInit, url: options.paymentRequiredResponse.url || options.request.url },
-    options.options,
-  );
+  const retried = (
+    await fetchWithRetries({ init: paidInit, url: options.request.url }, options.options)
+  ).response;
   await persistSessionReceipt(retried, options.record.channel_id, options.signedCumulative);
   return retried;
 }
@@ -1139,7 +1252,7 @@ const tip20Abi = [
 function sessionDepositRaw(details: SessionDetails, options: RequestOptions) {
   const maxSpend = options.maxSpend ? parseUnits(options.maxSpend, 6) : undefined;
   const preferred = details.suggestedDeposit ?? maxSpend ?? details.amount;
-  const deposit = maxSpend && preferred > maxSpend ? maxSpend : preferred;
+  const deposit = maxSpend !== undefined && preferred > maxSpend ? maxSpend : preferred;
   if (deposit < details.amount) throw paymentError("Session payment exceeds --max-spend");
   return deposit;
 }
@@ -1149,7 +1262,7 @@ async function assertSufficientSessionBalance(
   details: SessionDetails,
   depositRaw: bigint,
 ) {
-  const client = createTempoPublicClient(details.chainId === 42431 ? "testnet" : undefined);
+  const client = createTempoPublicClient(details.chainId === 42431 ? "testnet" : "mainnet");
   const balance = (
     await Actions.token.getBalance(client as never, {
       account: payer as `0x${string}`,
@@ -1584,15 +1697,25 @@ function paymentContext(challenge: { intent: string }, options: RequestOptions) 
 }
 
 function enforceMaxSpend(challenge: { request: Record<string, unknown> }, options: RequestOptions) {
-  if (!options.maxSpend) return;
   const amount = challenge.request.amount;
-  if (typeof amount !== "string") return;
+  if (typeof amount !== "string" || !/^\d+$/.test(amount))
+    throw paymentError("Payment challenge is missing a valid amount");
+  if (!options.maxSpend) return;
   const maxSpend = parseUnits(options.maxSpend, 6);
   const required = BigInt(amount);
   if (required <= maxSpend) return;
   throw paymentError(
     `Payment max spend exceeded: max=${options.maxSpend} required=${formatTokenAmount(required)}`,
   );
+}
+
+function validatePaymentAddresses(challenge: Challenge.Challenge) {
+  const request = challenge.request as Record<string, unknown>;
+  if (!isAddress(stringValue(request.currency)))
+    throw paymentError("Payment challenge is missing a valid currency address");
+  const isProof = challenge.intent === "charge" && BigInt(request.amount as string) === 0n;
+  if (!isProof && !isAddress(stringValue(request.recipient)))
+    throw paymentError("Payment challenge is missing a valid recipient address");
 }
 
 function formatTokenAmount(value: bigint) {
@@ -1670,12 +1793,6 @@ function parseNonNegativeInteger(value: string, flag: string) {
   if (!Number.isSafeInteger(parsed) || parsed < 0)
     throw usageError(`${flag} must be a non-negative integer`);
   return parsed;
-}
-
-function normalizeNetwork(value: string) {
-  if (value === "testnet" || value === "tempo-moderato" || value === "moderato") return "testnet";
-  if (value === "mainnet" || value === "tempo") return "mainnet";
-  throw usageError(`Unsupported network: ${value}`);
 }
 
 async function readDataValue(value: string) {
