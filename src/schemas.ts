@@ -36,12 +36,13 @@ export const whoamiOutput = z.union([
     ready: z.boolean(),
     wallet: z.string().nullable(),
     balance: z.object({
-      total: z.string(),
+      total: z.string().nullable(),
       locked: z.string(),
       pending_refund: z.string(),
-      available: z.string(),
+      available: z.string().nullable(),
       active_sessions: z.number(),
       symbol: z.string(),
+      error: z.object({ code: z.literal("E_RPC"), message: z.string() }).optional(),
     }),
     balances: z.array(
       z.object({
@@ -60,6 +61,8 @@ export const whoamiOutput = z.union([
         network: z.string(),
         symbol: z.string(),
         token: z.string(),
+        balance: z.string().nullable(),
+        balance_error: z.object({ code: z.literal("E_RPC"), message: z.string() }).optional(),
         spending_limit: z.object({
           unlimited: z.boolean(),
           limit: z.string(),
@@ -102,7 +105,8 @@ export const keysOutput = z.object({
       wallet_address: z.string().nullable(),
       symbol: z.string(),
       token: z.string(),
-      balance: z.string(),
+      balance: z.string().nullable(),
+      balance_error: z.object({ code: z.literal("E_RPC"), message: z.string() }).optional(),
       spending_limit: z.object({
         unlimited: z.boolean(),
         limit: z.string(),

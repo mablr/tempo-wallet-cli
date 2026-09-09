@@ -368,6 +368,23 @@ describe("identity commands", () => {
     expect(result.balance.symbol).toBe("PathUSD");
   });
 
+  it("does not report an RPC error or query a balance without a wallet", async () => {
+    const result = await currentWhoamiOutput({
+      walletAddress: null,
+      chain: 4217,
+      accessKeys: [],
+    });
+
+    expect(result).toMatchObject({
+      ready: false,
+      wallet: null,
+      balance: { available: null, total: null },
+      key: null,
+    });
+    expect(result.balance).not.toHaveProperty("error");
+    expect(mocks.readContract).not.toHaveBeenCalled();
+  });
+
   it("whoami reports ready with a wallet", async () => {
     await useTempHome();
     await writeWalletState(walletState());
@@ -456,6 +473,64 @@ describe("identity commands", () => {
         access_key_limit: "100",
       },
     ]);
+  });
+
+  it("reports RPC failure as an unknown balance and recovers when the RPC returns", async () => {
+    await useTempHome();
+    await writeWalletState(walletState());
+    await upsertSessionRecord(identitySession());
+    await upsertSessionRecord({
+      ...identitySession(),
+      channel_id: `0x${"b".repeat(64)}`,
+      state: "closing",
+      close_requested_at: 1,
+    });
+    mocks.readContract.mockRejectedValue(new Error("RPC unavailable"));
+
+    expect(await whoamiHandler({})).toMatchObject({
+      ready: false,
+      wallet: testWallet.toLowerCase(),
+      balance: {
+        total: null,
+        available: null,
+        locked: "0.008000",
+        pending_refund: "0.008000",
+        active_sessions: 1,
+        error: { code: "E_RPC" },
+      },
+      key: { status: "ready", balance: null },
+    });
+    expect(await keysHandler()).toMatchObject({
+      keys: [{ balance: null, balance_error: { code: "E_RPC" } }],
+    });
+
+    mocks.readContract.mockResolvedValue(5_000_000n);
+    const recovered = await whoamiHandler({});
+    expect(recovered).toMatchObject({
+      ready: true,
+      balance: { total: "5.016000", available: "5" },
+      key: { balance: "5" },
+    });
+    expect(recovered).not.toHaveProperty("balance.error");
+    const recoveredKeys = await keysHandler();
+    expect(recoveredKeys).toMatchObject({ keys: [{ balance: "5" }] });
+    expect(recoveredKeys.keys[0]).not.toHaveProperty("balance_error");
+  });
+
+  it("distinguishes a successful zero balance from an unavailable balance", async () => {
+    await useTempHome();
+    await writeWalletState(walletState());
+    mocks.readContract.mockResolvedValue(0n);
+
+    const result = await whoamiHandler({});
+    expect(result).toMatchObject({
+      ready: true,
+      balance: { total: "0.000000", available: "0" },
+      key: { balance: "0" },
+    });
+    expect(result).not.toHaveProperty("balance.error");
+    if (!("key" in result) || !result.key) expect.unreachable("expected key details");
+    expect(result.key).not.toHaveProperty("balance_error");
   });
 
   it("whoami reports an expired access key as not ready", async () => {
