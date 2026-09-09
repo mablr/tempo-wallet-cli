@@ -241,12 +241,14 @@ it("handles a CRLF separator split between network writes", async () => {
 
 it("honors fractional CLI timeout while waiting to retry", async () => {
   let requests = 0;
+  let requestStarted = 0;
   const url = await server((_req, res) => {
     requests++;
+    // Exclude Node/tsx startup from the request deadline assertion.
+    requestStarted = performance.now();
     res.writeHead(503, { "retry-after": "5" });
     res.end("busy");
   });
-  const started = Date.now();
   await expect(
     execFileAsync(process.execPath, [
       "--import",
@@ -259,6 +261,6 @@ it("honors fractional CLI timeout while waiting to retry", async () => {
       url,
     ]),
   ).rejects.toMatchObject({ code: 3 });
-  expect(Date.now() - started).toBeLessThan(2500);
   expect(requests).toBe(1);
+  expect(performance.now() - requestStarted).toBeLessThan(2500);
 });
